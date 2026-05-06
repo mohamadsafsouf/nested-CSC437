@@ -1,0 +1,26 @@
+-- update public.threat_levels
+-- set
+--   minimum_probability = 0.0000,
+--   maximum_probability = 0.5000,
+--   maximum_inclusive = false,
+--   dashboard_status_token = 'status.normal',
+--   alert_required = false
+-- where key = 'normal';
+
+-- update public.threat_levels
+-- set
+--   minimum_probability = 0.5000,
+--   maximum_probability = 0.8500,
+--   maximum_inclusive = false,
+--   dashboard_status_token = 'status.suspicious',
+--   alert_required = true
+-- where key = 'suspicious';
+
+-- update public.threat_levels
+-- set
+--   minimum_probability = 0.8500,
+--   maximum_probability = 1.0000,
+--   maximum_inclusive = true,
+--   dashboard_status_token = 'status.critical',
+--   alert_required = true
+-- where key = 'critical';

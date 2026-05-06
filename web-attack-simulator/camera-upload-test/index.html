@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CamGuard Web Attack Simulator</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #0f172a; }
+    body { max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    p.note { color: #475569; font-size: 0.9rem; }
+    video { background: #0f172a; border-radius: 8px; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0; }
+    button { padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid #94a3b8; background: #f8fafc; cursor: pointer; }
+    button:hover { background: #e2e8f0; }
+    .log { font-family: ui-monospace, monospace; font-size: 0.8rem; background: #f1f5f9; padding: 0.75rem; border-radius: 8px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>CamGuard Web Attack Simulator</h1>
+  <p class="note">Safe local tests only. The CamGuard Mac app listens on <code>127.0.0.1:39452</code> for a silent <code>POST /camguard/v1/hint</code> (JSON <code>{"host":"…"}</code>)—no “open app?” dialog. If the app is not running or the port is blocked, the page falls back to <code>camguard://</code> (Safari may prompt). FastAPI <code>dummy-upload</code> is separate metadata for the backend. Serve this folder at <code>http://localhost:3000/camera-upload-test/</code> and use query <code>?hintPort=39452</code> if you change the port.</p>
+  <p class="note"><strong>Backend required for tests 3 and 4.</strong> From the <code>backend/</code> directory, with a valid <code>.env</code>, run: <code>uvicorn app.main:app --host 127.0.0.1 --port 8000</code> (port is <strong>8000</strong>, not 800). If you use <code>?api=</code>, use <code>http://127.0.0.1:8000</code> with four digits.</p>
+
+  <video id="preview" autoplay playsinline width="480" height="360"></video>
+  <div class="row">
+    <button type="button" id="btn1">1. Normal Webcam Test</button>
+    <button type="button" id="btn2">2. Repeated Short Activation Test</button>
+    <button type="button" id="btn3">3. Camera + Dummy Upload Test</button>
+    <button type="button" id="btn4">4. Critical Simulation Test</button>
+    <button type="button" id="btnPing" title="No camera">Ping API (dummy upload)</button>
+    <button type="button" id="btnPingLoopback" title="CamGuard Mac must be running">Ping CamGuard loopback</button>
+  </div>
+  <div id="log" class="log" aria-live="polite"></div>
+
+  <script>
+    const logEl = document.getElementById("log");
+    const apiBase = (() => {
+      const q = new URLSearchParams(window.location.search).get("api");
+      let base = q ? q.replace(/\/$/, "") : "http://127.0.0.1:8000";
+      // Common typo: port 800 instead of 8000 (CamGuard’s default Uvicorn port)
+      if (/^https?:\/\/(127\.0\.0\.1|localhost):800$/.test(base)) {
+        base = base + "0";
+        if (q) {
+          console.warn("CamGuard simulator: port 800 was normalized to 8000. Use ?api=http://127.0.0.1:8000 or omit ?api.");
+        }
+      }
+      return base;
+    })();
+
+    function log(msg) {
+      const line = `[${new Date().toISOString()}] ${msg}\n`;
+      logEl.textContent = line + logEl.textContent;
+    }
+
+    function explainFetchError(err, requestUrl) {
+      const msg = (err && err.message) ? err.message : String(err);
+      if (msg === "Load failed" || msg === "Failed to fetch" || msg === "The network connection was lost.") {
+        return (
+          msg +
+          " — nothing answered at " +
+          requestUrl +
+          ". Start FastAPI: cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000" +
+          " (or set ?api=https://... for another port)."
+        );
+      }
+      return msg;
+    }
+
+    let stream = null;
+    const preview = document.getElementById("preview");
+
+    const camguardHintPath = "/camguard/v1/hint";
+    const hintPort = (() => {
+      const p = new URLSearchParams(window.location.search).get("hintPort");
+      if (p) {
+        const n = parseInt(p, 10);
+        if (n >= 1024 && n <= 65535) return n;
+      }
+      return 39452;
+    })();
+
+    function loopbackHintUrl() {
+      return "http://127.0.0.1:" + hintPort + camguardHintPath;
+    }
+
+    function hostForCorrelation() {
+      return window.location.hostname || "localhost";
+    }
+
+    function camguardUrlSchemeFallback(host) {
+      const u = "camguard://network-post?host=" + encodeURIComponent(host);
+      const f = document.createElement("iframe");
+      f.setAttribute("aria-hidden", "true");
+      f.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden";
+      f.src = u;
+      document.body.appendChild(f);
+      setTimeout(function () { f.remove(); }, 3000);
+    }
+
+    const noCamguardFallback = new URLSearchParams(window.location.search).get("noCamguardFallback") === "1";
+
+    async function notifyCamGuardApp() {
+      const host = hostForCorrelation();
+      const url = loopbackHintUrl();
+      const maxAttempts = 6;
+      const pauseMs = 400;
+      let lastErr = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (attempt > 1) {
+          await wait(pauseMs);
+          log("Loopback retry " + attempt + "/" + maxAttempts + " (listener may still be starting after port bind)…");
+        }
+        try {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ host: host }),
+            mode: "cors"
+          });
+          if (res.ok) {
+            log("Mac app hint OK (loopback POST " + url + ", no Safari “open app” prompt).");
+            return;
+          }
+          const t = await res.text();
+          lastErr = new Error("HTTP " + res.status + (t ? " " + t : ""));
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      log("Loopback hint failed after " + maxAttempts + " tries: " + (lastErr && lastErr.message ? lastErr.message : lastErr) + ".");
+      if (noCamguardFallback) {
+        log("Add CamGuard loopback hint manually or restart the Mac app; ?noCamguardFallback=1 disables camguard://.");
+        return;
+      }
+      log("Using camguard:// fallback (Safari may ask to open NetSecMacos).");
+      camguardUrlSchemeFallback(host);
+    }
+
+    async function startCamera() {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      preview.srcObject = stream;
+    }
+
+    function stopCamera() {
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+        stream = null;
+      }
+      preview.srcObject = null;
+    }
+
+    function wait(ms) {
+      return new Promise((r) => setTimeout(r, ms));
+    }
+
+    async function sendDummyUpload(testType) {
+      const requestUrl = apiBase + "/api/test/dummy-upload";
+      let res;
+      try {
+        res = await fetch(requestUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            simulation: true,
+            test_type: testType,
+            message: "No camera media uploaded. Metadata-only test.",
+            timestamp: new Date().toISOString()
+          })
+        });
+      } catch (e) {
+        throw new Error(explainFetchError(e, requestUrl));
+      }
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error("HTTP " + res.status + (t ? " " + t : ""));
+      }
+      log("POST " + testType + " ok (metadata only).");
+    }
+
+    async function normalWebcamTest() {
+      log("1 — Normal: ~10s session, no upload.");
+      await startCamera();
+      await wait(10000);
+      stopCamera();
+    }
+
+    async function cameraUploadTest() {
+      log("3 — Camera + dummy upload metadata.");
+      await startCamera();
+      await wait(2000);
+      await sendDummyUpload("camera_followed_by_network_upload");
+      await notifyCamGuardApp();
+      await wait(2000);
+      stopCamera();
+    }
+
+    async function repeatedShortActivationTest() {
+      log("2 — Short sessions x3 (3s on, 10s off), no upload.");
+      for (let i = 0; i < 3; i++) {
+        log("  cycle " + (i + 1) + "/3");
+        await startCamera();
+        await wait(3000);
+        stopCamera();
+        await wait(10000);
+      }
+    }
+
+    async function criticalSimulationTest() {
+      log("4 — Critical: same-source short x3 + dummy POST + app callback each cycle.");
+      for (let i = 0; i < 3; i++) {
+        log("  cycle " + (i + 1) + "/3");
+        await startCamera();
+        await wait(3000);
+        await sendDummyUpload("critical_camera_simulation");
+        await notifyCamGuardApp();
+        stopCamera();
+        await wait(10000);
+      }
+    }
+
+    document.getElementById("btn1").addEventListener("click", function () { normalWebcamTest().catch((e) => log("Error: " + e.message)); });
+    document.getElementById("btn2").addEventListener("click", function () { repeatedShortActivationTest().catch((e) => log("Error: " + e.message)); });
+    document.getElementById("btn3").addEventListener("click", function () { cameraUploadTest().catch((e) => log("Error: " + e.message)); });
+    document.getElementById("btn4").addEventListener("click", function () { criticalSimulationTest().catch((e) => log("Error: " + e.message)); });
+    document.getElementById("btnPing").addEventListener("click", function () {
+      log("API base: " + apiBase);
+      sendDummyUpload("api_ping").catch((e) => log("Error: " + e.message));
+    });
+    document.getElementById("btnPingLoopback").addEventListener("click", function () {
+      const url = "http://127.0.0.1:" + hintPort + "/health";
+      log("GET " + url + " (expects JSON when CamGuard Mac is running with monitoring on)");
+      fetch(url, { mode: "cors" })
+        .then(function (r) { return r.json().then(function (j) { return { r: r, j: j }; }); })
+        .then(function (x) {
+          if (!x.r.ok) throw new Error("HTTP " + x.r.status);
+          log("Loopback health: " + JSON.stringify(x.j));
+        })
+        .catch(function (e) { log("Loopback error: " + (e && e.message ? e.message : e)); });
+    });
+  </script>
+</body>
+</html>
